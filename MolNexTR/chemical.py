@@ -627,6 +627,117 @@ def _expand_functional_group(mol, mappings, debug=False):
     return smiles, mol
 
 
+IMAGE_IDX_PROP = '_molnextr_image_idx'
+MOLBLOCK_BOND_LENGTH = 1.5  # RDKit's depiction bond length
+
+
+def _same_stereo(mol, other):
+    """`other` (read back from a molblock of `mol`, same atom order) has the same constitution,
+    the same tetrahedral centres and the same E/Z on every double bond `mol` specifies."""
+    if Chem.MolToSmiles(mol, isomericSmiles=False) != Chem.MolToSmiles(other, isomericSmiles=False):
+        return False
+    centres = Chem.FindMolChiralCenters(mol, includeUnassigned=True, useLegacyImplementation=True)
+    other_centres = Chem.FindMolChiralCenters(other, includeUnassigned=True, useLegacyImplementation=True)
+    if sorted(centres) != sorted(other_centres):
+        return False
+    for bond in mol.GetBonds():
+        stereo = bond.GetStereo()
+        if stereo == Chem.BondStereo.STEREONONE or bond.GetBondType() != Chem.BondType.DOUBLE:
+            continue
+        other_bond = other.GetBondBetweenAtoms(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+        if other_bond is None or other_bond.GetStereo() != stereo:
+            return False
+    return True
+
+
+def _molblock_with_image_coords(mol, image_mol, debug=False):
+    """The molblock of `mol` (the molecule of the final SMILES) with the atom positions read off
+    the image, taken from `image_mol` (the predicted graph with its image conformer, before the
+    abbreviations were expanded). Atoms an expanded abbreviation added are laid out around the
+    image positions. The positions are scaled so the median bond is 1.5 (y up, x corrected for
+    the image's aspect ratio, as in the conformer). Returns None, so that the caller keeps the
+    computed layout, when the atoms do not map one to one or the molblock would not read back
+    as the same structure and stereo."""
+    try:
+        from rdkit.Chem import rdDepictor as depictor  # local: see align_chirality's globals
+        from rdkit.Geometry import Point2D
+
+        if mol is None or image_mol is None or image_mol.GetNumConformers() == 0:
+            return None
+        image_conf = image_mol.GetConformer()
+
+        # Expand the abbreviations again on a copy whose atoms carry their index in the image.
+        tagged = Chem.RWMol(image_mol)
+        for atom in tagged.GetAtoms():
+            atom.SetIntProp(IMAGE_IDX_PROP, atom.GetIdx())
+        _, expanded = _expand_functional_group(tagged, {})
+        expanded = Chem.Mol(expanded)
+        Chem.SanitizeMol(expanded)
+        expanded = Chem.RemoveHs(expanded)
+        if expanded.GetNumAtoms() != mol.GetNumAtoms() or expanded.GetNumBonds() != mol.GetNumBonds():
+            return None
+        match = mol.GetSubstructMatch(expanded)  # match[i]: atom of mol for atom i of expanded
+        if len(match) != mol.GetNumAtoms():
+            return None
+
+        known = {}
+        for i, j in enumerate(match):
+            atom = expanded.GetAtomWithIdx(i)
+            if atom.HasProp(IMAGE_IDX_PROP):
+                pos = image_conf.GetAtomPosition(atom.GetIntProp(IMAGE_IDX_PROP))
+                known[j] = (pos.x, pos.y)
+        lengths = sorted(
+            ((known[a][0] - known[b][0]) ** 2 + (known[a][1] - known[b][1]) ** 2) ** 0.5
+            for a, b in ((bd.GetBeginAtomIdx(), bd.GetEndAtomIdx()) for bd in mol.GetBonds())
+            if a in known and b in known)
+        if not lengths or lengths[len(lengths) // 2] <= 1e-6:
+            return None
+        scale = MOLBLOCK_BOND_LENGTH / lengths[len(lengths) // 2]
+        known = {j: (x * scale, y * scale) for j, (x, y) in known.items()}
+
+        out = Chem.Mol(mol)
+        out.RemoveAllConformers()
+        n = out.GetNumAtoms()
+        if len(known) == n:
+            conf = Chem.Conformer(n)
+            conf.Set3D(False)
+            for j, (x, y) in known.items():
+                conf.SetAtomPosition(j, (x, y, 0.0))
+            out.AddConformer(conf, assignId=True)
+        else:
+            prefer_coordgen = depictor.GetPreferCoordGen()
+            depictor.SetPreferCoordGen(False)  # RDKit's own depictor keeps coordMap atoms fixed
+            try:
+                depictor.Compute2DCoords(
+                    out, coordMap={j: Point2D(x, y) for j, (x, y) in known.items()},
+                    canonOrient=False)
+            finally:
+                depictor.SetPreferCoordGen(prefer_coordgen)
+            conf = out.GetConformer()
+            for j, (x, y) in known.items():
+                pos = conf.GetAtomPosition(j)
+                if abs(pos.x - x) > 0.01 or abs(pos.y - y) > 0.01:
+                    return None
+
+        # No two atoms on top of each other.
+        conf = out.GetConformer()
+        points = [conf.GetAtomPosition(j) for j in range(n)]
+        for a in range(n):
+            for b in range(a + 1, n):
+                if (points[a] - points[b]).Length() < 0.1 * MOLBLOCK_BOND_LENGTH:
+                    return None
+
+        molblock = Chem.MolToMolBlock(out)
+        back = Chem.MolFromMolBlock(molblock)
+        if back is None or back.GetNumAtoms() != n or not _same_stereo(mol, back):
+            return None
+        return molblock
+    except Exception:
+        if debug:
+            print(traceback.format_exc())
+        return None
+
+
 def _convert_graph_to_smiles(coords, symbols, edges, image=None, debug=False):
     mol = Chem.RWMol()
     n = len(symbols)
@@ -691,12 +802,20 @@ def _convert_graph_to_smiles(coords, symbols, edges, image=None, debug=False):
         # molblock is obtained before expanding func groups, otherwise the expanded group won't have coordinates.
         # TODO: make sure molblock has the abbreviation information
         pred_molblock = Chem.MolToMolBlock(mol)
+        try:
+            image_mol = Chem.Mol(mol)  # a copy holding the atom positions read off the image
+        except Exception:
+            image_mol = None
         pred_smiles, mol = _expand_functional_group(mol, {}, debug)
         #print(f"after_expansion_SMILES: {pred_smiles}")
         pred_smiles = align_chirality(smiles1, pred_smiles)
         #print(f"final_SMILES: {pred_smiles}\n")
+        # The molblock is written from the final SMILES so that it always agrees with it (the
+        # SMILES may be expanded or have its stereo realigned after the positions were set);
+        # the image positions are then put back on it where the atoms map one to one.
         mol = Chem.MolFromSmiles(pred_smiles)
         pred_molblock = Chem.MolToMolBlock(mol)
+        pred_molblock = _molblock_with_image_coords(mol, image_mol, debug) or pred_molblock
         success = True
     except Exception as e:
         if debug:
